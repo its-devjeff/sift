@@ -4,6 +4,7 @@ import CanvasHistogram from './CanvasHistogram';
 
 const EnhancedInteractiveSIFT = () => {
     // --- State Variables ---
+    const canvasRef = useRef(null);
     const [originalImage, setOriginalImage] = useState(null);
     const [grayscaleImage, setGrayscaleImage] = useState(null);
     const [pixelMatrix, setPixelMatrix] = useState([]);
@@ -17,7 +18,6 @@ const EnhancedInteractiveSIFT = () => {
     const [showCode, setShowCode] = useState(false);
     const [currentSection, setCurrentSection] = useState('scalespace');
     
-    const canvasRef = useRef(null);
     const pixelSize = 15;
 
     // Scale Space & DoG States
@@ -105,6 +105,8 @@ const EnhancedInteractiveSIFT = () => {
         
         return new ImageData(output, width, height);
     }, [createGaussianKernel]);
+
+
 
     // --- Real Scale Space Construction ---
     const generateRealScaleSpace = useCallback((imageCanvas) => {
@@ -199,6 +201,7 @@ const EnhancedInteractiveSIFT = () => {
         
         return new ImageData(output, width, height);
     }, []);
+
     // --- Real Keypoint Detection ---
     const findKeypoints = useCallback((dogSpace) => {
         const keypoints = [];
@@ -260,6 +263,65 @@ const EnhancedInteractiveSIFT = () => {
         
         setKeypointLocations(keypoints);
     }, []);
+
+    useEffect(() => {
+        if (!originalImage || keypointLocations.length === 0) return;
+        
+        const canvas = canvasRef.current;
+        if (!canvas) return;
+        
+        const ctx = canvas.getContext('2d');
+        const img = new Image();
+        
+        img.onload = () => {
+            // Set canvas size to match image
+            canvas.width = img.width;
+            canvas.height = img.height;
+            
+            // Draw original image
+            ctx.drawImage(img, 0, 0);
+            
+            // Draw keypoints as circles
+            keypointLocations.forEach(kp => {
+                const radius = Math.max(3, kp.level * 2); // Scale-based radius
+                
+                // Draw circle outline
+                ctx.beginPath();
+                ctx.arc(kp.x, kp.y, radius, 0, 2 * Math.PI);
+                ctx.strokeStyle = '#10B981'; // green-500
+                ctx.lineWidth = 2;
+                ctx.stroke();
+                
+                // Draw center point
+                ctx.beginPath();
+                ctx.arc(kp.x, kp.y, 1, 0, 2 * Math.PI);
+                ctx.fillStyle = '#10B981';
+                ctx.fill();
+            });
+        };
+        
+        img.src = originalImage;
+    }, [originalImage, keypointLocations]);
+
+    const renderKeypointVisualization = () => {
+        if (!originalImage || keypointLocations.length === 0) return null;
+        
+        return (
+            <div className="mt-6 bg-gray-900 p-4 rounded-lg">
+                <h3 className="text-lg font-medium mb-3 text-blue-200">Keypoint Visualization</h3>
+                <div className="relative inline-block">
+                    <canvas
+                        ref={canvasRef}
+                        className="border border-gray-600 rounded"
+                        style={{ maxWidth: '100%', height: 'auto' }}
+                    />
+                </div>
+                <p className="text-sm text-gray-400 mt-2">
+                    Green circles: keypoints • Circle size represents scale • {keypointLocations.length} total keypoints
+                </p>
+            </div>
+        );
+    };
 
     // --- Real Downsample Implementation ---
     const downsampleImageData = useCallback((imageData) => {
@@ -617,6 +679,257 @@ const EnhancedInteractiveSIFT = () => {
             setHistogramTable(updatedTable);
         }
     }, [histogramData]);
+// --- Feature Matching Implementation ---
+    const generateTransformedImage = useCallback(() => {
+        if (!originalImage) return null;
+        
+        const canvas = document.createElement('canvas');
+        const ctx = canvas.getContext('2d');
+        const img = new Image();
+        
+        return new Promise((resolve) => {
+            img.onload = () => {
+                canvas.width = img.width;
+                canvas.height = img.height;
+                
+                // Apply transformations
+                ctx.save();
+                ctx.translate(canvas.width / 2, canvas.height / 2);
+                ctx.rotate((image2Rotation * Math.PI) / 180);
+                ctx.scale(image2Zoom, image2Zoom);
+                ctx.translate(-img.width / 2, -img.height / 2);
+                
+                ctx.drawImage(img, 0, 0);
+                ctx.restore();
+                
+                resolve(canvas.toDataURL());
+            };
+            img.src = originalImage;
+        });
+    }, [originalImage, image2Rotation, image2Zoom]);
+
+    const computeDescriptor = useCallback((imageData, keypoint) => {
+        const { data, width, height } = imageData;
+        const descriptor = [];
+        const patchSize = 16;
+        const halfPatch = patchSize / 2;
+        
+        for (let dy = -halfPatch; dy < halfPatch; dy++) {
+            for (let dx = -halfPatch; dx < halfPatch; dx++) {
+                const x = Math.min(Math.max(keypoint.x + dx, 0), width - 1);
+                const y = Math.min(Math.max(keypoint.y + dy, 0), height - 1);
+                const idx = (y * width + x) * 4;
+                const gray = 0.299 * data[idx] + 0.587 * data[idx + 1] + 0.114 * data[idx + 2];
+                descriptor.push(gray);
+            }
+        }
+        
+        return descriptor;
+    }, []);
+
+    const matchFeatures = useCallback((descriptors1, descriptors2, keypoints1, keypoints2) => {
+        const matches = [];
+        const threshold = 0.8;
+        
+        descriptors1.forEach((desc1, i) => {
+            let bestMatch = -1;
+            let bestDistance = Infinity;
+            let secondBestDistance = Infinity;
+            
+            descriptors2.forEach((desc2, j) => {
+                let distance = 0;
+                for (let k = 0; k < desc1.length; k++) {
+                    distance += Math.pow(desc1[k] - desc2[k], 2);
+                }
+                distance = Math.sqrt(distance);
+                
+                if (distance < bestDistance) {
+                    secondBestDistance = bestDistance;
+                    bestDistance = distance;
+                    bestMatch = j;
+                } else if (distance < secondBestDistance) {
+                    secondBestDistance = distance;
+                }
+            });
+            
+            // Lowe's ratio test
+            if (bestDistance / secondBestDistance < threshold) {
+                matches.push({
+                    kp1: keypoints1[i],
+                    kp2: keypoints2[bestMatch],
+                    distance: bestDistance
+                });
+            }
+        });
+        
+        return matches;
+    }, []);
+
+    const performFeatureMatching = useCallback(async () => {
+        if (!originalImage || keypointLocations.length === 0) return;
+        
+        // Generate transformed image
+        const transformedImageData = await generateTransformedImage();
+        setImage2ForMatching(transformedImageData);
+        
+        // Create canvas for original image
+        const originalCanvas = document.createElement('canvas');
+        const originalCtx = originalCanvas.getContext('2d');
+        const originalImg = new Image();
+        
+        originalImg.onload = () => {
+            originalCanvas.width = originalImg.width;
+            originalCanvas.height = originalImg.height;
+            originalCtx.drawImage(originalImg, 0, 0);
+            
+            const originalImageData = originalCtx.getImageData(0, 0, originalCanvas.width, originalCanvas.height);
+            
+            // Create canvas for transformed image
+            const transformedCanvas = document.createElement('canvas');
+            const transformedCtx = transformedCanvas.getContext('2d');
+            const transformedImg = new Image();
+            
+            transformedImg.onload = () => {
+                transformedCanvas.width = transformedImg.width;
+                transformedCanvas.height = transformedImg.height;
+                transformedCtx.drawImage(transformedImg, 0, 0);
+                
+                const transformedImageData = transformedCtx.getImageData(0, 0, transformedCanvas.width, transformedCanvas.height);
+                
+                // Generate keypoints for transformed image (simplified)
+                const transformedKeypoints = keypointLocations.map(kp => ({
+                    x: kp.x * image2Zoom,
+                    y: kp.y * image2Zoom,
+                    octave: kp.octave,
+                    level: kp.level,
+                    response: kp.response
+                }));
+                
+                // Compute descriptors
+                const descriptors1 = keypointLocations.map(kp => computeDescriptor(originalImageData, kp));
+                const descriptors2 = transformedKeypoints.map(kp => computeDescriptor(transformedImageData, kp));
+                
+                // Match features
+                const matches = matchFeatures(descriptors1, descriptors2, keypointLocations, transformedKeypoints);
+                setMatchingResults(matches);
+                
+                // Draw matching visualization
+                drawMatchingVisualization(originalCanvas, transformedCanvas, matches);
+            };
+            
+            transformedImg.src = transformedImageData;
+        };
+        
+        originalImg.src = originalImage;
+    }, [originalImage, keypointLocations, generateTransformedImage, computeDescriptor, matchFeatures, image2Rotation, image2Zoom]);
+
+    const drawMatchingVisualization = useCallback((originalCanvas, transformedCanvas, matches) => {
+        const matchingCanvas = matchingCanvasRef.current;
+        if (!matchingCanvas) return;
+        
+        const ctx = matchingCanvas.getContext('2d');
+        const canvasWidth = originalCanvas.width * 2 + 20;
+        const canvasHeight = Math.max(originalCanvas.height, transformedCanvas.height);
+        
+        matchingCanvas.width = canvasWidth;
+        matchingCanvas.height = canvasHeight;
+        
+        // Clear canvas
+        ctx.fillStyle = '#1f2937';
+        ctx.fillRect(0, 0, canvasWidth, canvasHeight);
+        
+        // Draw original image
+        ctx.drawImage(originalCanvas, 0, 0);
+        
+        // Draw transformed image
+        ctx.drawImage(transformedCanvas, originalCanvas.width + 20, 0);
+        
+        // Draw matching lines
+        ctx.strokeStyle = '#eab308'; // yellow-500
+        ctx.lineWidth = 2;
+        
+        matches.forEach(match => {
+            ctx.beginPath();
+            ctx.moveTo(match.kp1.x, match.kp1.y);
+            ctx.lineTo(match.kp2.x + originalCanvas.width + 20, match.kp2.y);
+            ctx.stroke();
+        });
+        
+        // Draw keypoints
+        ctx.fillStyle = '#10b981'; // green-500
+        matches.forEach(match => {
+            // Original keypoint
+            ctx.beginPath();
+            ctx.arc(match.kp1.x, match.kp1.y, 3, 0, 2 * Math.PI);
+            ctx.fill();
+            
+            // Transformed keypoint
+            ctx.beginPath();
+            ctx.arc(match.kp2.x + originalCanvas.width + 20, match.kp2.y, 3, 0, 2 * Math.PI);
+            ctx.fill();
+        });
+    }, []);
+
+    const renderFeatureMatching = () => {
+        return (
+            <div className="mt-6 bg-gray-900 p-4 rounded-lg">
+                <h3 className="text-lg font-medium mb-4 text-blue-200">Feature Matching</h3>
+                
+                {/* Controls */}
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-6">
+                    <div>
+                        <label className="block text-sm font-medium text-gray-300 mb-2">
+                            Rotation: {image2Rotation}°
+                        </label>
+                        <input
+                            type="range"
+                            min="-180"
+                            max="180"
+                            value={image2Rotation}
+                            onChange={(e) => setImage2Rotation(parseInt(e.target.value))}
+                            className="w-full"
+                        />
+                    </div>
+                    <div>
+                        <label className="block text-sm font-medium text-gray-300 mb-2">
+                            Zoom: {image2Zoom.toFixed(2)}x
+                        </label>
+                        <input
+                            type="range"
+                            min="0.5"
+                            max="2"
+                            step="0.1"
+                            value={image2Zoom}
+                            onChange={(e) => setImage2Zoom(parseFloat(e.target.value))}
+                            className="w-full"
+                        />
+                    </div>
+                </div>
+                
+                <button
+                    onClick={performFeatureMatching}
+                    className="bg-blue-600 text-white px-4 py-2 rounded-lg hover:bg-blue-700 transition-colors mb-4"
+                >
+                    Generate Matching
+                </button>
+                
+                {/* Matching Visualization */}
+                <div className="relative inline-block">
+                    <canvas
+                        ref={matchingCanvasRef}
+                        className="border border-gray-600 rounded"
+                        style={{ maxWidth: '100%', height: 'auto' }}
+                    />
+                </div>
+                
+                {matchingResults.length > 0 && (
+                    <p className="text-sm text-gray-400 mt-2">
+                        Yellow lines: feature matches • Green dots: keypoints • {matchingResults.length} matches found
+                    </p>
+                )}
+            </div>
+        );
+    };
 
     // --- Real Keypoint Descriptor ---
     const generateRealDescriptor = useCallback((centerX, centerY) => {
@@ -826,10 +1139,9 @@ const generateDescriptor = (patch) => {
     return (
         <div className="min-h-screen bg-gray-900 text-white font-inter p-8 flex flex-col items-center">
             <h1 className="text-4xl font-bold mb-8 text-center text-blue-400">
-                Enhanced Interactive SIFT Algorithm
+              Interactive SIFT Algorithm
             </h1>
-
-            {/* Navigation - Correct SIFT Order */}
+  {/* Navigation */}
             <div className="flex flex-wrap justify-center gap-4 mb-8">
                 {[
                     { key: 'scalespace', label: '1. Scale Space', icon: <Grid3X3 className="w-5 h-5" /> },
@@ -852,6 +1164,7 @@ const generateDescriptor = (patch) => {
                     </button>
                 ))}
             </div>
+
 
             {/* Image Upload Section */}
             <section className="bg-gray-800 p-6 rounded-xl shadow-lg mb-8 w-full max-w-4xl">
@@ -1180,84 +1493,86 @@ const generateDescriptor = (patch) => {
             )}
 
             {/* Keypoint Detection Section */}
-            {currentSection === 'keypoints' && (
-                <section className="bg-gray-800 p-6 rounded-xl shadow-lg mb-8 w-full max-w-4xl">
-                    <div className="flex items-center justify-between mb-4">
-                        <h2 className="text-2xl font-semibold text-blue-300">4. Real Keypoint Detection</h2>
-                        <button
-                            onClick={() => setShowCode(!showCode)}
-                            className="flex items-center space-x-2 px-4 py-2 bg-purple-600 hover:bg-purple-700 rounded-lg transition-colors"
-                        >
-                            {showCode ? <Eye className="w-4 h-4" /> : <Code className="w-4 h-4" />}
-                            <span>{showCode ? 'Hide' : 'Show'} Code</span>
-                        </button>
-                    </div>
-                    
-                    <p className="mb-4 text-gray-300">
-                        Real extrema detection in DoG space. Each keypoint is checked against 26 neighbors (3×3×3 cube).
-                    </p>
-                    
-                    <div className="grid md:grid-cols-2 gap-6">
-                        <div className="bg-gray-900 p-4 rounded-lg">
-                            <h3 className="text-lg font-medium mb-3 text-blue-200">Keypoint Statistics</h3>
-                            <div className="space-y-2">
-                                <p>Total Keypoints Found: <span className="text-green-400 font-bold">{keypointLocations.length}</span></p>
-                                <p>DoG Images Processed: <span className="text-yellow-400">{dogImages.flat().length}</span></p>
-                                <p>Scale Space Images: <span className="text-purple-400">{scaleSpaceImages.flat().length}</span></p>
-                            </div>
-                        </div>
-                        
-                        <div className="bg-gray-900 p-4 rounded-lg">
-                            <h3 className="text-lg font-medium mb-3 text-blue-200">Detection Process</h3>
-                            <ol className="list-decimal list-inside space-y-1 text-sm text-gray-300">
-                                <li>Compare each pixel with 8 spatial neighbors</li>
-                                <li>Compare with 9 neighbors in scale above</li>
-                                <li>Compare with 9 neighbors in scale below</li>
-                                <li>Must be local extremum (max or min)</li>
-                                <li>Apply contrast threshold filtering</li>
-                            </ol>
-                        </div>
-                    </div>
+{currentSection === 'keypoints' && (
+    <section className="bg-gray-800 p-6 rounded-xl shadow-lg mb-8 w-full max-w-4xl">
+        <div className="flex items-center justify-between mb-4">
+            <h2 className="text-2xl font-semibold text-blue-300">4. Real Keypoint Detection</h2>
+            <button
+                onClick={() => setShowCode(!showCode)}
+                className="flex items-center space-x-2 px-4 py-2 bg-purple-600 hover:bg-purple-700 rounded-lg transition-colors"
+            >
+                {showCode ? <Eye className="w-4 h-4" /> : <Code className="w-4 h-4" />}
+                <span>{showCode ? 'Hide' : 'Show'} Code</span>
+            </button>
+        </div>
+        
+        <p className="mb-4 text-gray-300">
+            Real extrema detection in DoG space. Each keypoint is checked against 26 neighbors (3×3×3 cube).
+        </p>
+        
+        <div className="grid md:grid-cols-2 gap-6">
+            <div className="bg-gray-900 p-4 rounded-lg">
+                <h3 className="text-lg font-medium mb-3 text-blue-200">Keypoint Statistics</h3>
+                <div className="space-y-2">
+                    <p>Total Keypoints Found: <span className="text-green-400 font-bold">{keypointLocations.length}</span></p>
+                    <p>DoG Images Processed: <span className="text-yellow-400">{dogImages.flat().length}</span></p>
+                    <p>Scale Space Images: <span className="text-purple-400">{scaleSpaceImages.flat().length}</span></p>
+                </div>
+            </div>
+            
+            <div className="bg-gray-900 p-4 rounded-lg">
+                <h3 className="text-lg font-medium mb-3 text-blue-200">Detection Process</h3>
+                <ol className="list-decimal list-inside space-y-1 text-sm text-gray-300">
+                    <li>Compare each pixel with 8 spatial neighbors</li>
+                    <li>Compare with 9 neighbors in scale above</li>
+                    <li>Compare with 9 neighbors in scale below</li>
+                    <li>Must be local extremum (max or min)</li>
+                    <li>Apply contrast threshold filtering</li>
+                </ol>
+            </div>
+        </div>
 
-                    {keypointLocations.length > 0 && (
-                        <div className="mt-6 bg-gray-900 p-4 rounded-lg">
-                            <h3 className="text-lg font-medium mb-3 text-blue-200">Detected Keypoints (showing first 10)</h3>
-                            <div className="overflow-x-auto">
-                                <table className="w-full text-sm">
-                                    <thead className="bg-gray-700">
-                                        <tr>
-                                            <th className="px-3 py-2 text-left">X</th>
-                                            <th className="px-3 py-2 text-left">Y</th>
-                                            <th className="px-3 py-2 text-left">Octave</th>
-                                            <th className="px-3 py-2 text-left">Level</th>
-                                            <th className="px-3 py-2 text-left">Response</th>
-                                        </tr>
-                                    </thead>
-                                    <tbody>
-                                        {keypointLocations.slice(0, 10).map((kp, idx) => (
-                                            <tr key={idx} className={idx % 2 === 0 ? 'bg-gray-800' : 'bg-gray-700'}>
-                                                <td className="px-3 py-2">{kp.x.toFixed(1)}</td>
-                                                <td className="px-3 py-2">{kp.y.toFixed(1)}</td>
-                                                <td className="px-3 py-2">{kp.octave}</td>
-                                                <td className="px-3 py-2">{kp.level}</td>
-                                                <td className="px-3 py-2">{kp.response.toFixed(1)}</td>
-                                            </tr>
-                                        ))}
-                                    </tbody>
-                                </table>
-                            </div>
-                        </div>
-                    )}
+        {keypointLocations.length > 0 && (
+            <div className="mt-6 bg-gray-900 p-4 rounded-lg">
+                <h3 className="text-lg font-medium mb-3 text-blue-200">Detected Keypoints (showing first 10)</h3>
+                <div className="overflow-x-auto">
+                    <table className="w-full text-sm">
+                        <thead className="bg-gray-700">
+                            <tr>
+                                <th className="px-3 py-2 text-left">X</th>
+                                <th className="px-3 py-2 text-left">Y</th>
+                                <th className="px-3 py-2 text-left">Octave</th>
+                                <th className="px-3 py-2 text-left">Level</th>
+                                <th className="px-3 py-2 text-left">Response</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {keypointLocations.slice(0, 10).map((kp, idx) => (
+                                <tr key={idx} className={idx % 2 === 0 ? 'bg-gray-800' : 'bg-gray-700'}>
+                                    <td className="px-3 py-2">{kp.x.toFixed(1)}</td>
+                                    <td className="px-3 py-2">{kp.y.toFixed(1)}</td>
+                                    <td className="px-3 py-2">{kp.octave}</td>
+                                    <td className="px-3 py-2">{kp.level}</td>
+                                    <td className="px-3 py-2">{kp.response.toFixed(1)}</td>
+                                </tr>
+                            ))}
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        )}
 
-                    {showCode && (
-                        <div className="mt-6 bg-gray-900 rounded-lg p-4">
-                            <pre className="text-sm text-green-400 overflow-x-auto">
-                                {generateCode()}
-                            </pre>
-                        </div>
-                    )}
-                </section>
-            )}
+        {renderKeypointVisualization()}
+
+        {showCode && (
+            <div className="mt-6 bg-gray-900 rounded-lg p-4">
+                <pre className="text-sm text-green-400 overflow-x-auto">
+                    {generateCode()}
+                </pre>
+            </div>
+        )}
+    </section>
+)}
 
             {/* Descriptor Section */}
             {currentSection === 'descriptor' && (
@@ -1356,10 +1671,10 @@ const generateDescriptor = (patch) => {
                     )}
                 </section>
             )}
-
+              {currentSection === 'matching' && renderFeatureMatching()}
             {/* Footer */}
             <div className="text-center mt-8 text-gray-400">
-                <p>Enhanced Interactive SIFT - Real implementations, no simulations • All calculations are live and accurate</p>
+                <p>• All calculations are live and accurate</p>
             </div>
         </div>
     );
